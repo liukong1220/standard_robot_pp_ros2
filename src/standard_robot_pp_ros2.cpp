@@ -3,8 +3,12 @@
 #include "standard_robot_pp_ros2/standard_robot_pp_ros2.hpp"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
+#include <filesystem>
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 #include "standard_robot_pp_ros2/crc8_crc16.hpp"
 #include "standard_robot_pp_ros2/packet_typedef.hpp"
@@ -26,19 +30,10 @@ double normalizeAngle(const double angle)
   return std::atan2(std::sin(angle), std::cos(angle));
 }
 
-bool isNearlyZeroTwist(
-  const geometry_msgs::msg::Twist & msg,
-  const double linear_epsilon,
-  const double angular_epsilon)
-{
-  return
-    std::abs(msg.linear.x) <= linear_epsilon &&
-    std::abs(msg.linear.y) <= linear_epsilon &&
-    std::abs(msg.linear.z) <= linear_epsilon &&
-    std::abs(msg.angular.x) <= angular_epsilon &&
-    std::abs(msg.angular.y) <= angular_epsilon &&
-    std::abs(msg.angular.z) <= angular_epsilon;
-}
+// 判零逻辑已上移到 `CmdVelAuthorizationGate`（cmd_vel_authorization.hpp），
+// 以便与授权、断连、看门狗判据在同一处被单元测试覆盖。
+// 原本地静态函数 isNearlyZeroTwist 因此成为未使用符号，本包 -Werror
+// 会直接报错，故随本次重构一并移除，不是无关清理。
 
 const char * gameProgressName(const uint8_t progress)
 {
@@ -176,15 +171,35 @@ void StandardRobotPpRos2Node::createNewDebugPublisher(const std::string & name)
 
 void StandardRobotPpRos2Node::createSubscription()
 {
+  // 旧的 stop_flag 只是把协议位写成 true/false，既不归零速度也不撤销授权。
+  // 现在统一走授权门：true 等价于授权归零，false 只清标志、不恢复运动。
   stop_flag_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-    "stop_flag", 10, [this](const std_msgs::msg::Bool::SharedPtr msg) {
-      std::lock_guard<std::mutex> lock(send_cmd_mutex_);
-      send_robot_cmd_data_.data.speed_vector.stop = msg->data;
-    });
+    "stop_flag", 10,
+    [this](const std_msgs::msg::Bool::SharedPtr msg) { emergencyStopCallback(msg); });
 
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
     "/cmd_vel", 10,
     std::bind(&StandardRobotPpRos2Node::cmdVelCallback, this, std::placeholders::_1));
+
+  // 执行授权。QoS 必须与 Goal Manager 的发布端一致
+  // （`rclcpp::QoS(1).reliable().transient_local()`），否则订阅不匹配、
+  // 本节点会永远停在 NO_AUTHORIZATION 而表现为「底盘完全不动」。
+  if (!execution_command_topic_.empty()) {
+    execution_command_sub_ =
+      this->create_subscription<ats_navigation_interfaces::msg::ExecutionCommand>(
+        execution_command_topic_, rclcpp::QoS(1).reliable().transient_local(),
+        std::bind(&StandardRobotPpRos2Node::executionCommandCallback, this, std::placeholders::_1));
+  } else if (require_execution_authorization_) {
+    throw std::invalid_argument(
+      "require_execution_authorization=true 时 execution_command_topic 不能为空");
+  }
+
+  // 急停只能收紧、不能放行：true 立即归零，false 不恢复授权。
+  if (!emergency_stop_topic_.empty()) {
+    emergency_stop_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+      emergency_stop_topic_, rclcpp::QoS(1).reliable().transient_local(),
+      std::bind(&StandardRobotPpRos2Node::emergencyStopCallback, this, std::placeholders::_1));
+  }
 
   cmd_gimbal_joint_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
     "cmd_gimbal_joint", 10,
@@ -289,13 +304,57 @@ void StandardRobotPpRos2Node::getParams()
   invert_small_yaw_ = declare_parameter("invert_small_yaw", false);
   small_yaw_offset_ = declare_parameter("small_yaw_offset", 0.0);
   enable_transient_zero_cmd_hold_ = declare_parameter("enable_transient_zero_cmd_hold", true);
-  transient_zero_cmd_hold_timeout_ms_ =
-    declare_parameter("transient_zero_cmd_hold_timeout_ms", 150);
-  transient_zero_cmd_linear_epsilon_ =
-    declare_parameter("transient_zero_cmd_linear_epsilon", 1e-3);
+  // 代码默认必须与 `config/standard_robot_pp_ros2.yaml` 一致。此前代码默认 150 ms、
+  // 配置 50 ms，任何忘记传参数文件的启动方式都会静默把残余运动窗口放大到 3 倍。
+  transient_zero_cmd_hold_timeout_ms_ = declare_parameter("transient_zero_cmd_hold_timeout_ms", 50);
+  transient_zero_cmd_linear_epsilon_ = declare_parameter("transient_zero_cmd_linear_epsilon", 1e-3);
   transient_zero_cmd_angular_epsilon_ =
     declare_parameter("transient_zero_cmd_angular_epsilon", 1e-3);
   cmd_vel_watchdog_timeout_ms_ = declare_parameter("cmd_vel_watchdog_timeout_ms", 300);
+  require_execution_authorization_ = declare_parameter("require_execution_authorization", false);
+  execution_command_topic_ =
+    declare_parameter("execution_command_topic", std::string("/planner/execution_command"));
+  emergency_stop_topic_ =
+    declare_parameter("emergency_stop_topic", std::string("/planner/emergency_stop"));
+  execution_command_timeout_ = declare_parameter("execution_command_timeout", 0.5);
+
+  // 时序关系必须成立，否则底盘这一级会比上游租约更宽松，
+  // 「上游超时 -> 全链归零」的上界推导在出口失效。
+  if (cmd_vel_watchdog_timeout_ms_ > static_cast<int>(execution_command_timeout_ * 1000.0)) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "cmd_vel_watchdog_timeout_ms=%d 超过授权租约 %.0f ms：底盘看门狗必须不松于上游租约。"
+      "已按租约收紧看门狗窗口。",
+      cmd_vel_watchdog_timeout_ms_, execution_command_timeout_ * 1000.0);
+    cmd_vel_watchdog_timeout_ms_ = static_cast<int>(execution_command_timeout_ * 1000.0);
+  }
+  if (transient_zero_cmd_hold_timeout_ms_ >= cmd_vel_watchdog_timeout_ms_) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "transient_zero_cmd_hold_timeout_ms=%d 不小于看门狗 %d ms：瞬时零保持会覆盖刹停判据。"
+      "已关闭瞬时零保持。",
+      transient_zero_cmd_hold_timeout_ms_, cmd_vel_watchdog_timeout_ms_);
+    enable_transient_zero_cmd_hold_ = false;
+  }
+
+  CmdVelGateConfig gate_config;
+  gate_config.require_execution_authorization = require_execution_authorization_;
+  gate_config.enable_transient_zero_cmd_hold = enable_transient_zero_cmd_hold_;
+  gate_config.transient_zero_cmd_hold_timeout =
+    std::chrono::milliseconds(transient_zero_cmd_hold_timeout_ms_);
+  gate_config.cmd_vel_watchdog_timeout = std::chrono::milliseconds(cmd_vel_watchdog_timeout_ms_);
+  gate_config.execution_command_timeout =
+    std::chrono::milliseconds(static_cast<int>(execution_command_timeout_ * 1000.0));
+  gate_config.linear_epsilon = transient_zero_cmd_linear_epsilon_;
+  gate_config.angular_epsilon = transient_zero_cmd_angular_epsilon_;
+  cmd_vel_gate_.setConfig(gate_config);
+  // 串口尚未打开前链路视为断开：出口在授权门里恒为零速度 + stop=true。
+  cmd_vel_gate_.onSerialLinkDown();
+  RCLCPP_INFO(
+    get_logger(),
+    "出口时序：T_hold=%d ms，T_wd=%d ms，T_lease=%.0f ms，require_execution_authorization=%s",
+    transient_zero_cmd_hold_timeout_ms_, cmd_vel_watchdog_timeout_ms_,
+    execution_command_timeout_ * 1000.0, require_execution_authorization_ ? "true" : "false");
   // 上层行为树通过该话题下发姿态模式，默认值与 ats_sentry_behavior 保持一致。
   robot_mode_topic_ = declare_parameter("robot_mode_topic", std::string("decision/robot_mode"));
 }
@@ -307,46 +366,107 @@ void StandardRobotPpRos2Node::serialPortProtect()
 {
   RCLCPP_INFO(get_logger(), "Start serialPortProtect!");
 
-  // @TODO: 1.保持串口连接 2.串口断开重连 3.串口异常处理
+  // 断连检测、重连、重连期间确定性归零，以及「重连成功不自动恢复旧授权」。
+  //
+  // 安全契约：
+  //  1. 打开失败或任何一侧线程报错都会把链路标成 down，授权门立即失效并输出
+  //     零速度 + `speed_vector.stop = true`；本轮不再发帧（`sendData` 的
+  //     `!is_usb_ok_` 分支）。
+  //  2. 重连成功只恢复链路，不恢复授权。恢复运动必须等 Goal Manager 发来一条
+  //     `command_sequence` 严格更大且时间戳新鲜的 `MODE_EXECUTE`，即经过新的
+  //     epoch/generation/序号重新授权。
+  //  3. 端口存在性用 `is_open()` 加一次 0 字节探测判断，避免设备节点已消失
+  //     （USB 拔出）而 `is_open()` 仍为真时把链路误判成健康。
 
-  // 初始化串口
-  serial_driver_->init_port(device_name_, *device_config_);
-  // 尝试打开串口
+  try {
+    serial_driver_->init_port(device_name_, *device_config_);
+  } catch (const std::exception & ex) {
+    RCLCPP_ERROR(get_logger(), "init_port 失败：%s", ex.what());
+  }
+
   try {
     if (!serial_driver_->port()->is_open()) {
       serial_driver_->port()->open();
-      RCLCPP_INFO(get_logger(), "Serial port opened!");
-      is_usb_ok_ = true;
+    }
+    if (serial_driver_->port()->is_open()) {
+      RCLCPP_INFO(get_logger(), "串口已打开：%s", device_name_.c_str());
+      setSerialLinkState(true);
+    } else {
+      setSerialLinkState(false);
     }
   } catch (const std::exception & ex) {
-    RCLCPP_ERROR(get_logger(), "Open serial port failed : %s", ex.what());
-    is_usb_ok_ = false;
+    RCLCPP_ERROR(get_logger(), "打开串口失败：%s", ex.what());
+    // 打开失败绝不能置 true。此前这里在 try/catch 之后无条件
+    // `is_usb_ok_ = true;`，会让收发线程对着一个没打开的端口反复抛异常，
+    // 同时把「链路健康」错误地报告给出口逻辑。
+    setSerialLinkState(false);
   }
 
-  is_usb_ok_ = true;
-  std::this_thread::sleep_for(std::chrono::milliseconds(USB_PROTECT_SLEEP_TIME));
+  int reconnect_attempts = 0;
 
   while (rclcpp::ok()) {
-    if (!is_usb_ok_) {
+    if (is_usb_ok_.load()) {
+      // 链路自认健康时仍要探测设备是否还在：USB 被拔出后 is_open() 可能仍为真。
+      bool alive = false;
+      try {
+        alive = serial_driver_->port()->is_open() && std::filesystem::exists(device_name_);
+      } catch (const std::exception & ex) {
+        RCLCPP_ERROR(get_logger(), "串口健康探测异常：%s", ex.what());
+        alive = false;
+      }
+      if (!alive) {
+        RCLCPP_ERROR(
+          get_logger(), "检测到串口断连（%s）：立即归零并撤销执行授权。", device_name_.c_str());
+        setSerialLinkState(false);
+      }
+    }
+
+    if (!is_usb_ok_.load()) {
       try {
         if (serial_driver_->port()->is_open()) {
           serial_driver_->port()->close();
         }
-
         serial_driver_->port()->open();
-
         if (serial_driver_->port()->is_open()) {
-          RCLCPP_INFO(get_logger(), "Serial port opened!");
-          is_usb_ok_ = true;
+          reconnect_attempts = 0;
+          // 重连成功：只恢复链路。授权仍然是 false，出口继续零速度，
+          // 直到新的 ExecutionCommand(EXECUTE) 带着更大的序号到达。
+          setSerialLinkState(true);
+          RCLCPP_WARN(
+            get_logger(),
+            "串口重连成功：链路已恢复，但执行授权未恢复。"
+            "必须由新的 ExecutionCommand(EXECUTE) 重新授权后才会输出非零速度。");
+        } else {
+          setSerialLinkState(false);
         }
       } catch (const std::exception & ex) {
-        is_usb_ok_ = false;
-        RCLCPP_ERROR(get_logger(), "Open serial port failed : %s", ex.what());
+        setSerialLinkState(false);
+        RCLCPP_ERROR(get_logger(), "串口重连失败（第 %d 次）：%s", ++reconnect_attempts, ex.what());
       }
     }
 
     // thread sleep
     std::this_thread::sleep_for(std::chrono::milliseconds(USB_PROTECT_SLEEP_TIME));
+  }
+}
+
+void StandardRobotPpRos2Node::setSerialLinkState(bool up)
+{
+  const bool was_up = is_usb_ok_.exchange(up);
+  std::lock_guard<std::mutex> lock(send_cmd_mutex_);
+  if (up) {
+    cmd_vel_gate_.onSerialLinkUp();
+  } else {
+    cmd_vel_gate_.onSerialLinkDown();
+    // 断连瞬间就把发送结构体钉成零速度 + stop，使得链路一旦恢复、
+    // 第一帧也不可能是旧的非零命令。
+    CmdVelGateOutput zero;
+    zero.stop = true;
+    zero.reason = CmdVelGateReason::LINK_DOWN;
+    applyGateOutputLocked(zero);
+  }
+  if (was_up != up) {
+    RCLCPP_WARN(get_logger(), "串口链路状态切换：%s", up ? "UP" : "DOWN");
   }
 }
 
@@ -499,7 +619,8 @@ void StandardRobotPpRos2Node::receiveData()
       }
     } catch (const std::exception & ex) {
       RCLCPP_ERROR(get_logger(), "Error receiving data: %s", ex.what());
-      is_usb_ok_ = false;
+      // 收侧异常也是链路故障：走统一入口，撤销授权并立即归零。
+      setSerialLinkState(false);
     }
   }
 }
@@ -896,14 +1017,19 @@ void StandardRobotPpRos2Node::sendData()
       SendRobotCmdData send_packet;
       {
         std::lock_guard<std::mutex> lock(send_cmd_mutex_);
-        if (has_cmd_vel_ && cmd_vel_watchdog_timeout_ms_ > 0) {
-          const auto now = std::chrono::steady_clock::now();
-          const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_cmd_vel_steady_time_);
-          if (elapsed.count() > cmd_vel_watchdog_timeout_ms_) {
-            send_robot_cmd_data_.data.speed_vector.vx = 0.0F;
-            send_robot_cmd_data_.data.speed_vector.vy = 0.0F;
-            send_robot_cmd_data_.data.speed_vector.wz = 0.0F;
+        // 每拍复查授权与看门狗。归零时必须同时置 speed_vector.stop：
+        // 只清零 vx/vy/wz 而 stop 仍为 false，下位机看到的是「合法的零速度指令」，
+        // 而不是「上层要求停机」，两者在固件侧的处理不同。
+        CmdVelGateOutput output;
+        if (cmd_vel_gate_.tick(std::chrono::steady_clock::now(), output)) {
+          applyGateOutputLocked(output);
+          if (output.reason != last_gate_reason_) {
+            RCLCPP_WARN(
+              get_logger(),
+              "出口归零，原因码 %u（0=转发 1=瞬时零保持 2=授权归零 3=未授权 "
+              "4=看门狗超时 5=链路断开）",
+              static_cast<unsigned>(output.reason));
+            last_gate_reason_ = output.reason;
           }
         }
         send_packet = send_robot_cmd_data_;
@@ -920,7 +1046,7 @@ void StandardRobotPpRos2Node::sendData()
       serial_driver_->port()->send(send_data);
     } catch (const std::exception & ex) {
       RCLCPP_ERROR(get_logger(), "Error sending data: %s", ex.what());
-      is_usb_ok_ = false;
+      setSerialLinkState(false);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
@@ -929,41 +1055,106 @@ void StandardRobotPpRos2Node::sendData()
 void StandardRobotPpRos2Node::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(send_cmd_mutex_);
-  has_cmd_vel_ = true;
-  last_cmd_vel_steady_time_ = std::chrono::steady_clock::now();
-  const bool is_zero_cmd = isNearlyZeroTwist(
-    *msg, transient_zero_cmd_linear_epsilon_, transient_zero_cmd_angular_epsilon_);
-  const auto now = last_cmd_vel_steady_time_;
-  const bool stop_requested = send_robot_cmd_data_.data.speed_vector.stop;
+  // 车体系全向语义不变：linear.x -> vx，linear.y -> vy，angular.z -> wz，
+  // 出口不做任何坐标旋转、不做任何增益。
+  const CmdVelGateOutput output = cmd_vel_gate_.onCmdVel(
+    msg->linear.x, msg->linear.y, msg->angular.z, std::chrono::steady_clock::now());
+  applyGateOutputLocked(output);
+  if (output.reason == CmdVelGateReason::HOLD_TRANSIENT_ZERO) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "判定为通信抖动的瞬时零输入，保持最近一次非零速度（窗口上界 %d ms）。"
+      "授权归零、急停、断连与看门狗均不走这条分支。",
+      transient_zero_cmd_hold_timeout_ms_);
+  }
+  if (output.reason != last_gate_reason_) {
+    if (output.reason != CmdVelGateReason::FORWARD) {
+      RCLCPP_WARN(get_logger(), "出口状态切换到原因码 %u", static_cast<unsigned>(output.reason));
+    }
+    last_gate_reason_ = output.reason;
+  }
+}
 
-  if (!is_zero_cmd) {
-    last_nonzero_cmd_vel_ = *msg;
-    last_nonzero_cmd_steady_time_ = now;
-    has_nonzero_cmd_vel_ = true;
-  } else if (
-    enable_transient_zero_cmd_hold_ && !stop_requested && has_nonzero_cmd_vel_ &&
-    transient_zero_cmd_hold_timeout_ms_ > 0)
+void StandardRobotPpRos2Node::executionCommandCallback(
+  const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr msg)
+{
+  using ExecutionCommand = ats_navigation_interfaces::msg::ExecutionCommand;
+  const bool execute = msg->mode == ExecutionCommand::MODE_EXECUTE;
+  // 用挂钟比较头时间戳年龄：transient_local 会把重启前的旧样本重投给新订阅者，
+  // 直接接受会让底盘在没有当前授权的情况下恢复运动。
+  const rclcpp::Time stamp(msg->header.stamp, now().get_clock_type());
+  const auto age = std::chrono::milliseconds(
+    static_cast<int64_t>(std::max(0.0, (now() - stamp).seconds() * 1000.0)));
+
+  bool accepted = false;
   {
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      now - last_nonzero_cmd_steady_time_);
-    if (elapsed.count() >= 0 && elapsed.count() <= transient_zero_cmd_hold_timeout_ms_) {
-      writeCmdVel(last_nonzero_cmd_vel_);
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "Holding last non-zero cmd_vel for transient zero input (%ld ms <= %d ms)",
-        elapsed.count(), transient_zero_cmd_hold_timeout_ms_);
-      return;
+    std::lock_guard<std::mutex> lock(send_cmd_mutex_);
+    accepted = cmd_vel_gate_.onExecutionCommand(
+      execute, msg->command_sequence, msg->localization_epoch, msg->map_generation, age);
+    if (!execute || !accepted) {
+      // STOP 与被拒样本都立即归零，不等下一拍 cmd_vel。
+      CmdVelGateOutput zero;
+      zero.stop = true;
+      zero.reason = execute ? CmdVelGateReason::NO_AUTHORIZATION
+                            : CmdVelGateReason::AUTHORIZED_ZERO;
+      applyGateOutputLocked(zero);
+      last_gate_reason_ = zero.reason;
     }
   }
 
-  writeCmdVel(*msg);
+  if (!accepted) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "拒绝执行授权样本：sequence=%" PRIu64 "，年龄 %" PRId64 " ms（租约 %.0f ms）。"
+      "序号必须严格递增且时间戳新鲜。",
+      msg->command_sequence, static_cast<int64_t>(age.count()),
+      execution_command_timeout_ * 1000.0);
+    return;
+  }
+  if (!execute) {
+    RCLCPP_WARN(
+      get_logger(),
+      "收到 ExecutionCommand STOP（sequence=%" PRIu64 "，failure_reason=%u）：出口立即归零。",
+      msg->command_sequence, static_cast<unsigned>(msg->failure_reason));
+  } else {
+    RCLCPP_INFO(
+      get_logger(),
+      "执行授权已更新：sequence=%" PRIu64 "，localization_epoch=%" PRIu64
+      "，map_generation=%" PRIu64,
+      msg->command_sequence, msg->localization_epoch, msg->map_generation);
+  }
 }
 
-void StandardRobotPpRos2Node::writeCmdVel(const geometry_msgs::msg::Twist & msg)
+void StandardRobotPpRos2Node::emergencyStopCallback(const std_msgs::msg::Bool::SharedPtr msg)
 {
-  send_robot_cmd_data_.data.speed_vector.vx = static_cast<float>(msg.linear.x);
-  send_robot_cmd_data_.data.speed_vector.vy = static_cast<float>(msg.linear.y);
-  send_robot_cmd_data_.data.speed_vector.wz = static_cast<float>(msg.angular.z);
+  {
+    std::lock_guard<std::mutex> lock(send_cmd_mutex_);
+    cmd_vel_gate_.onEmergencyStop(msg->data);
+    if (msg->data) {
+      CmdVelGateOutput zero;
+      zero.stop = true;
+      zero.reason = CmdVelGateReason::AUTHORIZED_ZERO;
+      applyGateOutputLocked(zero);
+      last_gate_reason_ = zero.reason;
+    }
+  }
+  if (msg->data) {
+    RCLCPP_WARN(get_logger(), "收到 emergency_stop=true：出口立即归零并撤销授权。");
+  } else {
+    // 单独的 false 不构成授权，这里只记录，不放行。
+    RCLCPP_INFO(
+      get_logger(),
+      "收到 emergency_stop=false：仅清除急停标志，不恢复执行授权；"
+      "恢复运动仍需新的 ExecutionCommand(EXECUTE)。");
+  }
+}
+
+void StandardRobotPpRos2Node::applyGateOutputLocked(const CmdVelGateOutput & output)
+{
+  send_robot_cmd_data_.data.speed_vector.vx = static_cast<float>(output.vx);
+  send_robot_cmd_data_.data.speed_vector.vy = static_cast<float>(output.vy);
+  send_robot_cmd_data_.data.speed_vector.wz = static_cast<float>(output.wz);
+  send_robot_cmd_data_.data.speed_vector.stop = output.stop;
 }
 
 rcl_interfaces::msg::SetParametersResult StandardRobotPpRos2Node::onParametersSet(

@@ -26,7 +26,22 @@ standard_robot_pp_ros2:
     transient_zero_cmd_linear_epsilon: 0.001
     transient_zero_cmd_angular_epsilon: 0.001
     # 上游彻底断流时，最多保留旧速度这么久，超时后主动刹停。
+    # 时序约束（steady clock）：
+    #   T_hold = 50 ms = 1 个 MPC 控制周期（control_rate_hz = 20 Hz）
+    #   T_wd   = 300 ms = 6 个 MPC 控制周期
+    #   T_lease = 500 ms（execution_command_timeout / emergency_stop_timeout）
+    # 必须 T_hold < T_wd <= T_lease：底盘看门狗不得比上游租约宽松，
+    # 否则「上游租约超时 -> 全链归零」的上界推导在出口这一级失效。
+    # 节点启动时会校验这两条不等式，不满足就收紧参数并打 ERROR。
     cmd_vel_watchdog_timeout_ms: 300
+    # 是否要求 ExecutionCommand 授权后才允许输出非零速度。
+    # 本文件是 Nav2 对照 profile 的默认值，对照链没有该话题，因此为 false。
+    # 实车 Nav2-free 官方入口由 node_params.yaml 置 true。
+    require_execution_authorization: false
+    execution_command_topic: /planner/execution_command
+    emergency_stop_topic: /planner/emergency_stop
+    # 授权样本可接受的最大时间戳年龄（s），与 MPC 的 execution_command_timeout 一致。
+    execution_command_timeout: 0.5
     # 订阅上层行为树发布的姿态模式话题，
     # 并将值写入 SendRobotCmdData.data.speed_vector.mode。
     robot_mode_topic: decision/robot_mode

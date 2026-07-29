@@ -23,6 +23,9 @@
   <depend>std_srvs</depend>
   <depend>example_interfaces</depend>
   <depend>ats_rm_interfaces</depend>
+  <!-- 出口授权门直接消费 ExecutionCommand：没有这条依赖，串口层就只能靠
+       裸 Twist 和 Bool 判断是否允许运动，「唯一执行授权」在最后一级失效。 -->
+  <depend>ats_navigation_interfaces</depend>
   <depend>nav2_msgs</depend>
   <depend>rclcpp_action</depend>
   <depend>std_msgs</depend>
@@ -35,6 +38,7 @@
 
  
 
+  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ament_cmake_clang_format</test_depend>
