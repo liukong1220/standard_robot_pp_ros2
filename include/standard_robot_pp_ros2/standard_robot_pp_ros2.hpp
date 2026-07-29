@@ -3,6 +3,7 @@
 #ifndef STANDARD_ROBOT_PP_ROS2__STANDARD_ROBOT_PP_ROS2_HPP_
 #define STANDARD_ROBOT_PP_ROS2__STANDARD_ROBOT_PP_ROS2_HPP_
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -10,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ats_navigation_interfaces/msg/execution_command.hpp"
 #include "example_interfaces/msg/float64.hpp"
 #include "example_interfaces/msg/u_int8.hpp"
 #include "geometry_msgs/msg/twist.hpp"
@@ -26,6 +28,7 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "serial_driver/serial_driver.hpp"
+#include "standard_robot_pp_ros2/cmd_vel_authorization.hpp"
 #include "standard_robot_pp_ros2/packet_typedef.hpp"
 #include "standard_robot_pp_ros2/robot_info.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -40,7 +43,9 @@ public:
   ~StandardRobotPpRos2Node() override;
 
 private:
-  bool is_usb_ok_;
+  // 串口链路健康标志。由 receive/send 线程置 false，由 serialPortProtect 置 true；
+  // 多线程读写，必须是原子量，且每次翻转都要同步通知授权门。
+  std::atomic<bool> is_usb_ok_{false};
   bool debug_;
   std::unique_ptr<IoContext> owned_ctx_;
   std::string device_name_;
@@ -56,15 +61,18 @@ private:
   // 姿态模式订阅话题，默认来自行为树发布的 decision/robot_mode。
   std::string robot_mode_topic_;
   bool enable_transient_zero_cmd_hold_ = true;
-  int transient_zero_cmd_hold_timeout_ms_ = 150;
+  int transient_zero_cmd_hold_timeout_ms_ = 50;
   double transient_zero_cmd_linear_epsilon_ = 1e-3;
   double transient_zero_cmd_angular_epsilon_ = 1e-3;
   int cmd_vel_watchdog_timeout_ms_ = 300;
-  geometry_msgs::msg::Twist last_nonzero_cmd_vel_;
-  std::chrono::steady_clock::time_point last_cmd_vel_steady_time_;
-  std::chrono::steady_clock::time_point last_nonzero_cmd_steady_time_;
-  bool has_cmd_vel_ = false;
-  bool has_nonzero_cmd_vel_ = false;
+  // Nav2-free 官方 profile 必须为 true：没有 ExecutionCommand 授权时出口恒零。
+  bool require_execution_authorization_ = false;
+  std::string execution_command_topic_;
+  std::string emergency_stop_topic_;
+  double execution_command_timeout_ = 0.5;
+  // 出口授权与归零判据的唯一实现，见 cmd_vel_authorization.hpp。
+  CmdVelAuthorizationGate cmd_vel_gate_;
+  CmdVelGateReason last_gate_reason_ = CmdVelGateReason::NO_AUTHORIZATION;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr
     parameter_callback_handle_;
 
@@ -89,6 +97,10 @@ private:
   // Subscribe
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr stop_flag_sub_;
+  // 执行授权与急停。授权是唯一放行来源，单独的 emergency_stop=false 不恢复运动。
+  rclcpp::Subscription<ats_navigation_interfaces::msg::ExecutionCommand>::SharedPtr
+    execution_command_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr emergency_stop_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr cmd_gimbal_joint_sub_;
   rclcpp::Subscription<example_interfaces::msg::UInt8>::SharedPtr cmd_shoot_sub_;
   // 订阅上层姿态模式，并写入串口发送结构体中的 speed_vector.mode。
@@ -122,11 +134,17 @@ private:
   void publishLegacyJointState(ReceiveLegacyJointState & data);
   void publishBuff(ReceiveBuff & data);
 
-  void writeCmdVel(const geometry_msgs::msg::Twist & msg);
+  // 把授权门的判定结果写入发送结构体，包含 speed_vector.stop。
+  void applyGateOutputLocked(const CmdVelGateOutput & output);
+  // 链路状态翻转的唯一入口：同步 is_usb_ok_ 与授权门，断连即归零。
+  void setSerialLinkState(bool up);
   rcl_interfaces::msg::SetParametersResult onParametersSet(
     const std::vector<rclcpp::Parameter> & params);
 
   void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
+  void executionCommandCallback(
+    const ats_navigation_interfaces::msg::ExecutionCommand::SharedPtr msg);
+  void emergencyStopCallback(const std_msgs::msg::Bool::SharedPtr msg);
   void cmdGimbalJointCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
   void cmdShootCallback(const example_interfaces::msg::UInt8::SharedPtr msg);
   // 把行为树发来的 move/attack/defend 模式映射到下位机协议字段。
