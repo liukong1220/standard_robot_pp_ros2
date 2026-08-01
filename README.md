@@ -1,148 +1,181 @@
 # standard_robot_pp_ros2
 
-当前工作区中的上下位机串口桥接与裁判系统接口层。
+ATS 哨兵上位机与下位机/裁判系统之间的 ROS 2 串口桥。它是实机底盘命令的
+最终出口，同时发布云台关节、IMU、机器人状态和裁判系统数据。
 
-本包当前职责：
+> Nav2-free 正式入口要求 `ExecutionCommand` 授权；包内默认配置仍服务于
+> Nav2 对照 profile，因此 `require_execution_authorization` 默认是 `false`。
 
-1. 把下位机串口数据解析成 ROS 话题
-2. 接收导航与行为树输出并写回串口发送结构
-3. 作为 `/cmd_vel`、姿态模式、裁判系统和云台关节状态的实机桥梁
+## 目录
 
-## 当前入口
+- [功能模块](#功能模块)
+- [依赖](#依赖)
+- [Quick Start](#quick-start)
+- [启动节点](#启动节点)
+- [接口](#接口)
+- [安全与时序](#安全与时序)
+- [配置文件](#配置文件)
+- [数据流](#数据流)
+- [测试与验证边界](#测试与验证边界)
+- [参考与致谢](#参考与致谢)
 
-启动文件：
+## 功能模块
 
-- [launch/standard_robot_pp_ros2.launch.py](./launch/standard_robot_pp_ros2.launch.py)
+| 模块 | 说明 |
+| :--- | :--- |
+| 串口协议 | 解析下位机/裁判系统数据并编码控制帧 |
+| 底盘出口 | 接收 `/cmd_vel`，写入车体系 `speed_vector[vx, vy, wz]` |
+| 授权门 | 校验 `ExecutionCommand`、急停、串口状态和 watchdog |
+| 云台桥 | `cmd_gimbal` 到关节指令，发布三自由度反馈 |
+| yaw 状态桥 | 结合 joint/TF 发布 `/gimbal/yaw_status` |
+| 裁判系统 | 发布比赛、血量、事件、RFID、机器人状态等消息 |
 
-默认参数：
+本包不拥有路径规划、速度坐标变换或 MPC。Nav2-free 下 MPC 必须已经输出车体系
+速度，串口层只做授权、限时保持、归零和协议转换。
 
-- [config/standard_robot_pp_ros2.yaml](./config/standard_robot_pp_ros2.yaml)
+## 依赖
 
-当前通常由整车总入口拉起：
+- ROS 2 Humble
+- `rclcpp`、`serial_driver`、ASIO
+- `ats_rm_interfaces`、`ats_navigation_interfaces`
+- `geometry_msgs`、`sensor_msgs`、`std_msgs`、`tf2_ros`
 
-- [../ats_sentry_bringup/launch/bringup.launch.py](../ats_sentry_bringup/launch/bringup.launch.py)
+## Quick Start
 
-## 当前与上层系统的对接
+```bash
+cd /home/ats/ATS_2026_snetry_test
+source /opt/ros/humble/setup.bash
+MAKEFLAGS=-j1 colcon build --base-paths src \
+  --packages-up-to standard_robot_pp_ros2 \
+  --parallel-workers 1 --symlink-install
+source install/setup.bash
+```
 
-### 1. 底盘速度
+## 启动节点
 
-当前订阅：
+单包入口：
 
-- `/cmd_vel`
+```bash
+ros2 launch standard_robot_pp_ros2 standard_robot_pp_ros2.launch.py \
+  params_file:=src/standard_robot_pp_ros2/config/standard_robot_pp_ros2.yaml
+```
 
-并写入串口发送结构：
+实机正常部署由 `ats_sentry_bringup` 启动，并传入根仓
+`src/ats_sentry_bringup/params/node_params.yaml`。单包默认配置与正式总入口的授权
+开关不同，调试时必须先确认实际加载文件。
 
-- `SendRobotCmdData.data.speed_vector.vx`
-- `SendRobotCmdData.data.speed_vector.vy`
-- `SendRobotCmdData.data.speed_vector.wz`
+主要节点：
 
-当前还额外做了两层保护：
+- `standard_robot_pp_ros2_node`
+- `gimbal_manager_node`
+- `gimbal_yaw_status_bridge`，由外层在需要真实云台 ack 时启动
 
-1. 瞬时零速短时保持
-2. `cmd_vel` 断流 watchdog
-3. 串口发送前的速度倍率适配
+## 接口
 
-对应代码：
+### 底盘与安全输入
 
-- [src/standard_robot_pp_ros2.cpp](./src/standard_robot_pp_ros2.cpp)
+| Topic | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `/cmd_vel` | `geometry_msgs/Twist` | 车体系 `[vx, vy, wz]` |
+| `/planner/execution_command` | `ats_navigation_interfaces/ExecutionCommand` | 正式链唯一非零执行授权 |
+| `/planner/emergency_stop` | `std_msgs/Bool` | `true` 立即归零并撤销授权 |
+| `decision/robot_mode` | `example_interfaces/UInt8` | 写入协议 `speed_vector.mode` |
+| `cmd_gimbal` | `ats_rm_interfaces/GimbalCmd` | 云台命令 |
 
-### 2. 姿态模式
+### 主要输出
 
-当前行为树通过：
+| Topic | 说明 |
+| :--- | :--- |
+| `serial/imu` | 下位机 IMU，frame 为 `gimbal_pitch` |
+| `serial/gimbal_joint_state` | `gimbal_yaw_odom_joint`、`gimbal_yaw_joint`、`gimbal_pitch_joint` |
+| `serial/robot_motion` | 下位机反馈的车体速度 |
+| `serial/robot_state_info` | 机器人硬件类型与状态 |
+| `referee/*` | 比赛、血量、事件、位置、RFID、buff 等 |
+| `/gimbal/yaw_status` | yaw authority ack 与 TF 健康状态 |
 
-- `decision/robot_mode`
+`/gimbal/yaw_status` 使用 reliable + transient-local QoS。其实机 publisher 必须唯一；
+MuJoCo 的模拟 ack 与实机桥不能同时运行。
 
-发布姿态模式，本包订阅后写入：
+## 安全与时序
 
-- `SendRobotCmdData.data.speed_vector.mode`
+当前默认时序关系：
 
-当前固定约定：
+$$
+T_{hold}=50\,\mathrm{ms}<T_{watchdog}=300\,\mathrm{ms}
+\le T_{lease}=500\,\mathrm{ms}
+$$
 
-- `move = 3`
-- `attack = 1`
-- `defend = 2`
+- 短暂全零保持只覆盖 1 个 20 Hz MPC 周期，减少偶发单帧冲击。
+- cmd_vel 断流超过 300 ms 后主动归零并设置 `speed_vector.stop=true`。
+- `ExecutionCommand STOP`、`emergency_stop=true`、串口断连或授权过期都归零。
+- 单独收到 `emergency_stop=false` 只清急停标志，不恢复执行授权。
+- 旧 command sequence、过期时间戳和旧 reference 不得重新放行。
 
-协议定义：
+节点会检查 watchdog 不宽于 execution lease，并在配置不满足时收紧参数。
 
-- [include/standard_robot_pp_ros2/packet_typedef.hpp](./include/standard_robot_pp_ros2/packet_typedef.hpp)
+## 配置文件
 
-### 3. 裁判系统数据
+| 文件 | 用途 |
+| :--- | :--- |
+| `config/standard_robot_pp_ros2.yaml` | 单包/Nav2 对照默认配置 |
+| `../ats_sentry_bringup/params/node_params.yaml` | 正式实机总入口实际配置 |
 
-当前会把下位机上传的裁判系统字段发布为：
+关键参数：
 
-- `referee/game_status`
-- `referee/robot_status`
-- `referee/rfid_status`
-- 以及其他裁判相关话题
+- `device_name`、`baud_rate`、`flow_control`、`parity`、`stop_bits`
+- `require_execution_authorization`
+- `execution_command_topic`、`emergency_stop_topic`
+- `execution_command_timeout`、`cmd_vel_watchdog_timeout_ms`
+- `enable_transient_zero_cmd_hold`、`transient_zero_cmd_hold_timeout_ms`
+- `accept_legacy_two_axis_joint_state` 与 small-yaw 方向/offset
 
-这些话题是行为树资源门控、受击检测和比赛状态判断的直接数据源。
+未来参数统一后正式实机值应只在根仓总 YAML 出现；包内 YAML 可保留为显式对照
+或示例，但不能与总入口同时成为“正式权威”。
 
-### 4. 云台关节与 IMU
+## 数据流
 
-当前会发布：
+```text
+Goal Manager atomic ExecutionCommand ----+
+MPC body-frame /cmd_vel -----------------+-> CmdVelAuthorizationGate
+emergency_stop + serial link + watchdog -+          |
+                                                     v
+                                  speed_vector[vx, vy, wz, mode, stop]
+                                                     |
+                                                     v
+                                               serial firmware
+```
 
-- `serial/gimbal_joint_state`
-- `serial/imu`
+云台状态链：
 
-其中 `gimbal_joint_state` 供 `joint_state_publisher` / `robot_state_publisher` 维护整车 TF 链。
+```text
+serial/gimbal_joint_state + odom TF + yaw authority request
+  -> gimbal_yaw_status_bridge
+  -> /gimbal/yaw_status
+  -> Goal Manager + MPC
+```
 
-## 当前关键参数
+禁止新增第二个 `base_footprint -> base_link` TF publisher。fake-yaw 关闭时仍需
+保留 `gimbal_yaw_odom -> gimbal_yaw_fake` 零旋转兼容 TF，直到所有 consumer
+完成 frame 迁移。
 
-最常动的参数在：
+## 测试与验证边界
 
-- [config/standard_robot_pp_ros2.yaml](./config/standard_robot_pp_ros2.yaml)
+```bash
+colcon test --base-paths src --packages-select standard_robot_pp_ros2
+colcon test-result --test-result-base build/standard_robot_pp_ros2 --verbose
+```
 
-尤其是：
+实机/HIL 还必须测量断流、STOP、急停、串口拔插和旧授权恢复，观察 `/cmd_vel`
+以及下位机实际 `speed_vector.stop`，不能只看上游 topic。
 
-- `device_name`
-- `baud_rate`
-- `robot_mode_topic`
-- `enable_transient_zero_cmd_hold`
-- `transient_zero_cmd_hold_timeout_ms`
-- `cmd_vel_watchdog_timeout_ms`
-- `publish_imu_as_gimbal_joint_state`
-- `accept_legacy_two_axis_joint_state`
-- `small_yaw_is_relative`
+- **已验证**：README 中 topic、默认时序和授权逻辑由源码/配置静态交叉核对。
+- **未验证**：本轮未连接串口、未做抬轮 HIL 或落地实车测试。
+- **残余风险**：`max_wheel_acceleration` 等动力学值仍需台架标定；真实固件单位和滚动半径需同口径复核。
 
-## 当前常见维护问题
+工作区级说明见
+[视觉与串口桥说明](../../docs/视觉与串口桥说明.md)。
 
-### 1. `/cmd_vel` 有值但底盘卡顿
+## 参考与致谢
 
-先看：
-
-1. `enable_transient_zero_cmd_hold`
-2. `transient_zero_cmd_hold_timeout_ms`
-3. `cmd_vel_watchdog_timeout_ms`
-4. 上游 `/cmd_vel` 是否夹杂零速帧
-5. 上游 `/cmd_vel` 是否已经在速度转换节点中限幅和限加速度
-
-### 2. 姿态模式不生效
-
-先看：
-
-1. `decision/robot_mode`
-2. `robot_mode_topic`
-3. `packet_typedef.hpp` 中的模式枚举
-4. 下位机协议是否与当前约定一致
-
-### 3. TF 不完整或云台投影不对
-
-先看：
-
-1. `serial/gimbal_joint_state`
-2. `publish_imu_as_gimbal_joint_state`
-3. `accept_legacy_two_axis_joint_state`
-4. `small_yaw_is_relative`
-
-## 当前维护边界
-
-1. 改串口协议、模式字段映射、瞬时零速保护，在本包改
-2. 改姿态切换规则、视觉接管、受击自旋，不在本包改，去 `ats_sentry_behavior`
-3. 改 `/cmd_vel` 生成链，不在本包改，去 `ats_sentry_nav`
-4. 改整车启动和总参数入口，不在本包改，去 `ats_sentry_bringup`
-
-## 相关文档
-
-- [../../docs/总览.md](../../docs/总览.md)
-- [../../docs/sentry_posture_switch_logic.md](../../docs/sentry_posture_switch_logic.md)
-- [../../docs/实机视觉跟随优化方案.md](../../docs/实机视觉跟随优化方案.md)
+串口基础设施使用 ROS 2 `serial_driver`/ASIO，并延续 StandardRobot++ 协议适配。
+具体版权、协议兼容和许可证以仓内源码与依赖声明为准。
