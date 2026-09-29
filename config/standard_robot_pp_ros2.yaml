@@ -34,11 +34,16 @@ standard_robot_pp_ros2:
     # 否则「上游租约超时 -> 全链归零」的上界推导在出口这一级失效。
     # 节点启动时会校验这两条不等式，不满足就收紧参数并打 ERROR。
     cmd_vel_watchdog_timeout_ms: 300
+    # 速度入口话题。官方入口（node_params.yaml）与代码默认一致指向 arbiter
+    # 的 /cmd_vel/selected：自动源授权由 arbiter 执行，串口只对 selected 做
+    # 急停、看门狗和断连归零，不直接订阅手动 /cmd_vel 绕过仲裁。
+    cmd_vel_topic: /cmd_vel/selected
     # 是否要求 ExecutionCommand 授权后才允许输出非零速度。
-    # 本文件是 Nav2 对照 profile 的默认值，对照链没有该话题，因此为 false。
-    # 实车 Nav2-free 官方入口由 node_params.yaml 置 true。
+    # 本文件是包级默认值，与官方入口一致置 false：授权门在 arbiter 一级。
     require_execution_authorization: false
-    execution_command_topic: /planner/execution_command
+    # 官方入口不订阅 ExecutionCommand（arbiter 已执行自动源授权）；
+    # 需要 Nav2 对照链授权门时由参数文件显式覆盖为非空话题。
+    execution_command_topic: ""
     emergency_stop_topic: /planner/emergency_stop
     # 授权样本可接受的最大时间戳年龄（s），与 MPC 的 execution_command_timeout 一致。
     execution_command_timeout: 0.5

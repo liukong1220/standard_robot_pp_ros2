@@ -178,7 +178,7 @@ void StandardRobotPpRos2Node::createSubscription()
     [this](const std_msgs::msg::Bool::SharedPtr msg) { emergencyStopCallback(msg); });
 
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
-    "/cmd_vel", 10,
+    cmd_vel_topic_, 10,
     std::bind(&StandardRobotPpRos2Node::cmdVelCallback, this, std::placeholders::_1));
 
   // 执行授权。QoS 必须与 Goal Manager 的发布端一致
@@ -311,9 +311,17 @@ void StandardRobotPpRos2Node::getParams()
   transient_zero_cmd_angular_epsilon_ =
     declare_parameter("transient_zero_cmd_angular_epsilon", 1e-3);
   cmd_vel_watchdog_timeout_ms_ = declare_parameter("cmd_vel_watchdog_timeout_ms", 300);
+  // 速度入口话题参数化。默认与官方入口 node_params.yaml 一致，指向 arbiter
+  // 的 /cmd_vel/selected：实机执行端只接收 selected，不直接订阅手动 /cmd_vel，
+  // 否则会绕过仲裁的急停、租约和手动/自动优先级，使稳定契约失效。
+  cmd_vel_topic_ =
+    declare_parameter("cmd_vel_topic", std::string("/cmd_vel/selected"));
   require_execution_authorization_ = declare_parameter("require_execution_authorization", false);
+  // 官方入口（node_params.yaml）把 execution_command_topic 置空、由 arbiter
+  // 执行自动源授权；串口只对 selected 做急停、看门狗和断连归零。Nav2 对照
+  // profile 的旧默认值保留在 standard_robot_pp_ros2.yaml，仍可被参数文件覆盖。
   execution_command_topic_ =
-    declare_parameter("execution_command_topic", std::string("/planner/execution_command"));
+    declare_parameter("execution_command_topic", std::string(""));
   emergency_stop_topic_ =
     declare_parameter("emergency_stop_topic", std::string("/planner/emergency_stop"));
   execution_command_timeout_ = declare_parameter("execution_command_timeout", 0.5);
