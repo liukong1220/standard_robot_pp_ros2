@@ -65,6 +65,8 @@ private:
   double transient_zero_cmd_linear_epsilon_ = 1e-3;
   double transient_zero_cmd_angular_epsilon_ = 1e-3;
   int cmd_vel_watchdog_timeout_ms_ = 300;
+  // 速度入口话题。默认与官方入口一致，指向 arbiter 的 /cmd_vel/selected。
+  std::string cmd_vel_topic_{ "/cmd_vel/selected" };
   // Nav2-free 官方 profile 必须为 true：没有 ExecutionCommand 授权时出口恒零。
   bool require_execution_authorization_ = false;
   std::string execution_command_topic_;
