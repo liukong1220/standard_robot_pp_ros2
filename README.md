@@ -3,8 +3,10 @@
 ATS 哨兵上位机与下位机/裁判系统之间的 ROS 2 串口桥。它是实机底盘命令的
 最终出口，同时发布云台关节、IMU、机器人状态和裁判系统数据。
 
-> Nav2-free 正式入口要求 `ExecutionCommand` 授权；包内默认配置仍服务于
-> Nav2 对照 profile，因此 `require_execution_authorization` 默认是 `false`。
+> 底盘速度入口由参数 `cmd_vel_topic` 指定，代码默认与正式入口一致为
+> `cmd_vel_arbiter` 输出的 `/cmd_vel/selected`。自动源的 `ExecutionCommand`
+> 授权、租约与手动/自动优先级由 arbiter 执行，因此包内默认与正式入口均为
+> `require_execution_authorization: false`、`execution_command_topic: ""`。
 
 ## 目录
 
@@ -24,14 +26,16 @@ ATS 哨兵上位机与下位机/裁判系统之间的 ROS 2 串口桥。它是�
 | 模块 | 说明 |
 | :--- | :--- |
 | 串口协议 | 解析下位机/裁判系统数据并编码控制帧 |
-| 底盘出口 | 接收 `/cmd_vel`，写入车体系 `speed_vector[vx, vy, wz]` |
-| 授权门 | 校验 `ExecutionCommand`、急停、串口状态和 watchdog |
+| 底盘出口 | 接收 `cmd_vel_topic`（默认 `/cmd_vel/selected`），写入车体系 `speed_vector[vx, vy, wz]` |
+| 授权门 | 校验急停、串口状态和 watchdog；`execution_command_topic` 非空时额外校验 `ExecutionCommand` |
 | 云台桥 | `cmd_gimbal` 到关节指令，发布三自由度反馈 |
 | yaw 状态桥 | 结合 joint/TF 发布 `/gimbal/yaw_status` |
 | 裁判系统 | 发布比赛、血量、事件、RFID、机器人状态等消息 |
 
-本包不拥有路径规划、速度坐标变换或 MPC。Nav2-free 下 MPC 必须已经输出车体系
-速度，串口层只做授权、限时保持、归零和协议转换。
+本包不拥有路径规划、速度坐标变换、MPC 或手动/自动速度仲裁。Nav2-free 下进入
+`/cmd_vel/selected` 的必须已经是车体系速度，串口层只做急停、限时保持、归零和
+协议转换；不要让串口直接订阅手动 `/cmd_vel`，否则会绕过 arbiter 的急停、租约
+和优先级。
 
 ## 依赖
 
@@ -61,8 +65,9 @@ ros2 launch standard_robot_pp_ros2 standard_robot_pp_ros2.launch.py \
 ```
 
 实机正常部署由 `ats_sentry_bringup` 启动，并传入根仓
-`src/ats_sentry_bringup/params/node_params.yaml`。单包默认配置与正式总入口的授权
-开关不同，调试时必须先确认实际加载文件。
+`src/ats_sentry_bringup/params/node_params.yaml`。单包默认配置的速度入口与授权
+开关已与正式总入口对齐；单包调试时 `/cmd_vel/selected` 需要由 `cmd_vel_arbiter`
+发布，否则底盘收不到速度。调试时仍应先确认实际加载文件。
 
 主要节点：
 
@@ -76,8 +81,8 @@ ros2 launch standard_robot_pp_ros2 standard_robot_pp_ros2.launch.py \
 
 | Topic | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `/cmd_vel` | `geometry_msgs/Twist` | 车体系 `[vx, vy, wz]` |
-| `/planner/execution_command` | `ats_navigation_interfaces/ExecutionCommand` | 正式链唯一非零执行授权 |
+| `/cmd_vel/selected`（参数 `cmd_vel_topic`） | `geometry_msgs/Twist` | arbiter 选出的车体系 `[vx, vy, wz]` |
+| `execution_command_topic`（默认空，不订阅） | `ats_navigation_interfaces/ExecutionCommand` | 可选授权门；Nav2 对照链需要时由参数文件覆盖为非空话题（如 `/planner/execution_command`） |
 | `/planner/emergency_stop` | `std_msgs/Bool` | `true` 立即归零并撤销授权 |
 | `decision/robot_mode` | `example_interfaces/UInt8` | 写入协议 `speed_vector.mode` |
 | `cmd_gimbal` | `ats_rm_interfaces/GimbalCmd` | 云台命令 |
@@ -107,7 +112,8 @@ $$
 
 - 短暂全零保持只覆盖 1 个 20 Hz MPC 周期，减少偶发单帧冲击。
 - cmd_vel 断流超过 300 ms 后主动归零并设置 `speed_vector.stop=true`。
-- `ExecutionCommand STOP`、`emergency_stop=true`、串口断连或授权过期都归零。
+- `emergency_stop=true`、串口断连都归零；启用 `ExecutionCommand` 订阅时，
+  `STOP` 或授权过期也归零。
 - 单独收到 `emergency_stop=false` 只清急停标志，不恢复执行授权。
 - 旧 command sequence、过期时间戳和旧 reference 不得重新放行。
 
@@ -117,14 +123,16 @@ $$
 
 | 文件 | 用途 |
 | :--- | :--- |
-| `config/standard_robot_pp_ros2.yaml` | 单包/Nav2 对照默认配置 |
+| `config/standard_robot_pp_ros2.yaml` | 单包默认配置，速度入口与授权开关已与总入口对齐 |
 | `../ats_sentry_bringup/params/node_params.yaml` | 正式实机总入口实际配置 |
 
 关键参数：
 
 - `device_name`、`baud_rate`、`flow_control`、`parity`、`stop_bits`
-- `require_execution_authorization`
-- `execution_command_topic`、`emergency_stop_topic`
+- `cmd_vel_topic`（默认 `/cmd_vel/selected`）
+- `require_execution_authorization`（默认 `false`）
+- `execution_command_topic`（默认 `""`，为空时不订阅；`require_execution_authorization=true`
+  时不能为空，否则节点启动抛异常）、`emergency_stop_topic`
 - `execution_command_timeout`、`cmd_vel_watchdog_timeout_ms`
 - `enable_transient_zero_cmd_hold`、`transient_zero_cmd_hold_timeout_ms`
 - `accept_legacy_two_axis_joint_state` 与 small-yaw 方向/offset
@@ -135,9 +143,14 @@ $$
 ## 数据流
 
 ```text
-Goal Manager atomic ExecutionCommand ----+
-MPC body-frame /cmd_vel -----------------+-> CmdVelAuthorizationGate
+manual /cmd_vel + autonomy /cmd_vel/autonomy + ExecutionCommand
+  -> cmd_vel_arbiter（自动源授权、租约、手动/自动优先级）
+  -> /cmd_vel/selected
+                                                     |
+                                                     v
+/cmd_vel/selected -----------------------+-> CmdVelAuthorizationGate
 emergency_stop + serial link + watchdog -+          |
+(可选) ExecutionCommand -----------------+          |
                                                      v
                                   speed_vector[vx, vy, wz, mode, stop]
                                                      |
@@ -165,7 +178,7 @@ colcon test --base-paths src --packages-select standard_robot_pp_ros2
 colcon test-result --test-result-base build/standard_robot_pp_ros2 --verbose
 ```
 
-实机/HIL 还必须测量断流、STOP、急停、串口拔插和旧授权恢复，观察 `/cmd_vel`
+实机/HIL 还必须测量断流、STOP、急停、串口拔插和旧授权恢复，观察 `/cmd_vel/selected`
 以及下位机实际 `speed_vector.stop`，不能只看上游 topic。
 
 - **已验证**：README 中 topic、默认时序和授权逻辑由源码/配置静态交叉核对。
