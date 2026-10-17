@@ -28,7 +28,7 @@ ATS 哨兵上位机与下位机/裁判系统之间的 ROS 2 串口桥。它是�
 | 串口协议 | 解析下位机/裁判系统数据并编码控制帧 |
 | 底盘出口 | 接收 `cmd_vel_topic`（默认 `/cmd_vel/selected`），写入车体系 `speed_vector[vx, vy, wz]` |
 | 授权门 | 校验急停、串口状态和 watchdog；`execution_command_topic` 非空时额外校验 `ExecutionCommand` |
-| 云台桥 | `cmd_gimbal` 到关节指令，发布三自由度反馈 |
+| 云台桥 | `cmd_gimbal` 到关节指令，发布三自由度反馈；视觉 ROS 2 通过 `/serial/gimbal_state`/`/serial/gimbal_cmd` 接入 |
 | yaw 状态桥 | 结合 joint/TF 发布 `/gimbal/yaw_status` |
 | 裁判系统 | 发布比赛、血量、事件、RFID、机器人状态等消息 |
 
@@ -97,6 +97,9 @@ ros2 launch standard_robot_pp_ros2 standard_robot_pp_ros2.launch.py \
 | `serial/robot_state_info` | 机器人硬件类型与状态 |
 | `referee/*` | 比赛、血量、事件、位置、RFID、buff 等 |
 | `/gimbal/yaw_status` | yaw authority ack 与 TF 健康状态 |
+| `/serial/link_up` | `std_msgs/msg/Bool`，50 ms 链路心跳；断连为 `false`，供 arbiter 和监控使用 |
+| `/serial/gimbal_state` | `std_msgs/msg/Float64MultiArray`，11 元 `[mode,qw,qx,qy,qz,yaw,yaw_vel,pitch,pitch_vel,bullet_speed,bullet_count]` |
+| `/serial/gimbal_cmd` | `std_msgs/msg/Float64MultiArray`，7 元命令；100 ms 无新帧停发 |
 
 `/gimbal/yaw_status` 使用 reliable + transient-local QoS。其实机 publisher 必须唯一；
 MuJoCo 的模拟 ack 与实机桥不能同时运行。
@@ -161,6 +164,8 @@ emergency_stop + serial link + watchdog -+          |
 云台状态链：
 
 ```text
+电控 0x0E -> standard_robot_pp_ros2 -> /serial/gimbal_state -> sp_vision25 GimbalTopicBridge
+sp_vision25 -> /serial/gimbal_cmd -> standard_robot_pp_ros2 -> 电控 0x02
 serial/gimbal_joint_state + odom TF + yaw authority request
   -> gimbal_yaw_status_bridge
   -> /gimbal/yaw_status
@@ -181,12 +186,12 @@ colcon test-result --test-result-base build/standard_robot_pp_ros2 --verbose
 实机/HIL 还必须测量断流、STOP、急停、串口拔插和旧授权恢复，观察 `/cmd_vel/selected`
 以及下位机实际 `speed_vector.stop`，不能只看上游 topic。
 
-- **已验证**：README 中 topic、默认时序和授权逻辑由源码/配置静态交叉核对。
-- **未验证**：本轮未连接串口、未做抬轮 HIL 或落地实车测试。
+- **已验证**：PTY 双向回环 `LINK_UP_TRUE=True`、状态 topic、`GIMBAL_CMD_FRAMES=404`、CRC 全部有效、断开后 `LINK_UP_AFTER_DISCONNECT=False`；定向 GTest 为 `14/14`、`10/10`、`2/2`。
+- **未验证**：真实电控字节/波特率、抬轮 HIL、落地实车和旧授权恢复的硬件行为。
 - **残余风险**：`max_wheel_acceleration` 等动力学值仍需台架标定；真实固件单位和滚动半径需同口径复核。
 
 工作区级说明见
-[视觉与串口桥说明](../../docs/视觉与串口桥说明.md)。
+[视觉与串口桥说明](../../docs/代码框架设计/视觉与串口桥说明.md)。
 
 ## 参考与致谢
 
