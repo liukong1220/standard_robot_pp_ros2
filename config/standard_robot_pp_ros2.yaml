@@ -1,7 +1,9 @@
 standard_robot_pp_ros2:
   ros__parameters:
     device_name: /dev/ttyACM0
-    baud_rate: 115200
+    baud_rate: 115200  # 与当前电控固件一致；切换 921600 前必须同步固件版本
+    enable_gimbal_bridge: true
+    fire_inhibit_on_emergency_stop: true
     flow_control: none
     parity: none
     stop_bits: "1"
