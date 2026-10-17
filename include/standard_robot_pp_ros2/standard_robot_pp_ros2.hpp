@@ -29,7 +29,9 @@
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "serial_driver/serial_driver.hpp"
 #include "standard_robot_pp_ros2/cmd_vel_authorization.hpp"
+#include "standard_robot_pp_ros2/gimbal_bridge_addon.hpp"
 #include "standard_robot_pp_ros2/packet_typedef.hpp"
+#include "standard_robot_pp_ros2/packet_typedef_addon.hpp"
 #include "standard_robot_pp_ros2/robot_info.hpp"
 #include "std_msgs/msg/bool.hpp"
 
@@ -51,6 +53,11 @@ private:
   std::string device_name_;
   std::unique_ptr<drivers::serial_driver::SerialPortConfig> device_config_;
   std::unique_ptr<drivers::serial_driver::SerialDriver> serial_driver_;
+  std::mutex serial_write_mutex_;
+  std::unique_ptr<GimbalBridgeAddon> gimbal_bridge_;
+  bool enable_gimbal_bridge_ = true;
+  bool fire_inhibit_on_emergency_stop_ = true;
+  std::atomic<bool> emergency_stop_active_{false};
   bool record_rosbag_;
   bool set_detector_color_;
   bool publish_imu_as_gimbal_joint_state_;
@@ -95,6 +102,8 @@ private:
   rclcpp::Publisher<ats_rm_interfaces::msg::RobotStatus>::SharedPtr robot_status_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
   rclcpp::Publisher<ats_rm_interfaces::msg::Buff>::SharedPtr buff_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr link_up_pub_;
+  rclcpp::TimerBase::SharedPtr link_up_timer_;
 
   // Subscribe
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
@@ -140,6 +149,7 @@ private:
   void applyGateOutputLocked(const CmdVelGateOutput & output);
   // 链路状态翻转的唯一入口：同步 is_usb_ok_ 与授权门，断连即归零。
   void setSerialLinkState(bool up);
+  void sendSerialFrame(const std::vector<uint8_t> & frame);
   rcl_interfaces::msg::SetParametersResult onParametersSet(
     const std::vector<rclcpp::Parameter> & params);
 

@@ -103,6 +103,24 @@ StandardRobotPpRos2Node::StandardRobotPpRos2Node(const rclcpp::NodeOptions & opt
   createPublisher();
   createSubscription();
 
+  enable_gimbal_bridge_ = declare_parameter("enable_gimbal_bridge", true);
+  if (enable_gimbal_bridge_) {
+    gimbal_bridge_ = std::make_unique<GimbalBridgeAddon>(
+      *this,
+      [this](const std::vector<uint8_t> & frame) {
+        try {
+          sendSerialFrame(frame);
+        } catch (const std::exception & ex) {
+          RCLCPP_ERROR(get_logger(), "Error sending gimbal command: %s", ex.what());
+          setSerialLinkState(false);
+        }
+      },
+      [this]() {
+        return is_usb_ok_.load() &&
+          (!fire_inhibit_on_emergency_stop_ || !emergency_stop_active_.load());
+      });
+  }
+
   robot_models_.chassis = {
     {0, "无底盘"}, {1, "麦轮底盘"}, {2, "全向轮底盘"}, {3, "舵轮底盘"}, {4, "平衡底盘"}};
   robot_models_.gimbal = {{0, "无云台"}, {1, "yaw_pitch直连云台"}};
@@ -117,6 +135,8 @@ StandardRobotPpRos2Node::StandardRobotPpRos2Node(const rclcpp::NodeOptions & opt
 
 StandardRobotPpRos2Node::~StandardRobotPpRos2Node()
 {
+  // 云台发送线程必须先退出，避免访问已销毁的串口对象。
+  gimbal_bridge_.reset();
   if (send_thread_.joinable()) {
     send_thread_.join();
   }
@@ -159,6 +179,13 @@ void StandardRobotPpRos2Node::createPublisher()
   robot_status_pub_ =
     this->create_publisher<ats_rm_interfaces::msg::RobotStatus>("referee/robot_status", 10);
   buff_pub_ = this->create_publisher<ats_rm_interfaces::msg::Buff>("referee/buff", 10);
+  link_up_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+    "/serial/link_up", rclcpp::QoS(1).reliable().transient_local());
+  link_up_timer_ = this->create_wall_timer(std::chrono::milliseconds(50), [this]() {
+    std_msgs::msg::Bool msg;
+    msg.data = is_usb_ok_.load();
+    link_up_pub_->publish(msg);
+  });
 }
 
 void StandardRobotPpRos2Node::createNewDebugPublisher(const std::string & name)
@@ -325,6 +352,8 @@ void StandardRobotPpRos2Node::getParams()
   emergency_stop_topic_ =
     declare_parameter("emergency_stop_topic", std::string("/planner/emergency_stop"));
   execution_command_timeout_ = declare_parameter("execution_command_timeout", 0.5);
+  fire_inhibit_on_emergency_stop_ =
+    declare_parameter("fire_inhibit_on_emergency_stop", true);
 
   // 时序关系必须成立，否则底盘这一级会比上游租约更宽松，
   // 「上游超时 -> 全链归零」的上界推导在出口失效。
@@ -525,6 +554,15 @@ void StandardRobotPpRos2Node::receiveData()
         continue;
       }
 
+      // 所有活动协议帧总长不得超过 64 B；先拒绝异常长度再分配缓冲区，
+      // 避免损坏的 len 字节把接收线程拖入超大分配/阻塞读取。
+      if (header_frame.len > 58U) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Ignore serial frame with payload length %u (>58)", header_frame.len);
+        continue;
+      }
+
       // crc8_ok 校验正确后读取数据段
       // 根据数据段长度读取数据
       std::vector<uint8_t> data_buf(header_frame.len + 2);  // len + crc
@@ -620,6 +658,19 @@ void StandardRobotPpRos2Node::receiveData()
         case ID_BUFF: {
           ReceiveBuff buff = fromVector<ReceiveBuff>(data_buf);
           publishBuff(buff);
+        } break;
+        case ID_GIMBAL_STATE: {
+          const auto expected_len = sizeof(ReceiveGimbalStateData) - sizeof(HeaderFrame) - 2U;
+          if (header_frame.len != expected_len) {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 1000,
+              "Ignore ID_GIMBAL_STATE with payload length %u, expected %zu",
+              header_frame.len, expected_len);
+            break;
+          }
+          if (gimbal_bridge_) {
+            gimbal_bridge_->publishGimbalState(fromVector<ReceiveGimbalStateData>(data_buf));
+          }
         } break;
         default: {
           RCLCPP_WARN(get_logger(), "Invalid id: %d", header_frame.id);
@@ -1051,7 +1102,7 @@ void StandardRobotPpRos2Node::sendData()
 
       // 发送数据
       std::vector<uint8_t> send_data = toVector(send_packet);
-      serial_driver_->port()->send(send_data);
+      sendSerialFrame(send_data);
     } catch (const std::exception & ex) {
       RCLCPP_ERROR(get_logger(), "Error sending data: %s", ex.what());
       setSerialLinkState(false);
@@ -1135,6 +1186,7 @@ void StandardRobotPpRos2Node::executionCommandCallback(
 
 void StandardRobotPpRos2Node::emergencyStopCallback(const std_msgs::msg::Bool::SharedPtr msg)
 {
+  emergency_stop_active_.store(msg->data);
   {
     std::lock_guard<std::mutex> lock(send_cmd_mutex_);
     cmd_vel_gate_.onEmergencyStop(msg->data);
@@ -1155,6 +1207,18 @@ void StandardRobotPpRos2Node::emergencyStopCallback(const std_msgs::msg::Bool::S
       "收到 emergency_stop=false：仅清除急停标志，不恢复执行授权；"
       "恢复运动仍需新的 ExecutionCommand(EXECUTE)。");
   }
+}
+
+void StandardRobotPpRos2Node::sendSerialFrame(const std::vector<uint8_t> & frame)
+{
+  if (!is_usb_ok_.load()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(serial_write_mutex_);
+  if (!serial_driver_->port()->is_open()) {
+    throw std::runtime_error("serial port is closed");
+  }
+  serial_driver_->port()->send(frame);
 }
 
 void StandardRobotPpRos2Node::applyGateOutputLocked(const CmdVelGateOutput & output)

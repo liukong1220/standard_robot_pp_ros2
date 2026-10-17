@@ -69,6 +69,13 @@ if(BUILD_TESTING)
   # 实车云台 ack 判据的功能测试。同样是纯逻辑，不需要云台上电。
   ament_add_gtest(test_gimbal_yaw_status_logic test/test_gimbal_yaw_status_logic.cpp)
   target_include_directories(test_gimbal_yaw_status_logic PRIVATE include)
+
+  ament_add_gtest(
+    test_gimbal_protocol
+    test/test_gimbal_protocol.cpp
+    src/crc8_crc16.cpp
+  )
+  target_include_directories(test_gimbal_protocol PRIVATE include)
 endif()
 
 #############

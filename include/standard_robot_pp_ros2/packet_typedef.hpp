@@ -434,8 +434,9 @@ struct SendRobotCmdData
 template <typename T>
 inline T fromVector(const std::vector<uint8_t> & data)
 {
-  T packet;
-  std::copy(data.begin(), data.end(), reinterpret_cast<uint8_t *>(&packet));
+  T packet{};
+  const auto copy_size = std::min(data.size(), sizeof(T));
+  std::copy_n(data.begin(), copy_size, reinterpret_cast<uint8_t *>(&packet));
   return packet;
 }
 
