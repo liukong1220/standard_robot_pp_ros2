@@ -113,7 +113,7 @@ T_{hold}=50\,\mathrm{ms}<T_{watchdog}=300\,\mathrm{ms}
 \le T_{lease}=500\,\mathrm{ms}
 $$
 
-- 短暂全零保持只覆盖 1 个 20 Hz MPC 周期，减少偶发单帧冲击。
+- 短暂全零保持（50 ms）覆盖不超过 2.5 个 50 Hz MPC 控制周期，减少偶发单帧零速抖动。
 - cmd_vel 断流超过 300 ms 后主动归零并设置 `speed_vector.stop=true`。
 - `emergency_stop=true`、串口断连都归零；启用 `ExecutionCommand` 订阅时，
   `STOP` 或授权过期也归零。
@@ -176,11 +176,11 @@ serial/gimbal_joint_state + odom TF + yaw authority request
 保留 `gimbal_yaw_odom -> gimbal_yaw_fake` 零旋转兼容 TF，直到所有 consumer
 完成 frame 迁移。
 
-## 测试与验证边界
+## 验证边界
 
 ```bash
-colcon test --base-paths src --packages-select standard_robot_pp_ros2
-colcon test-result --test-result-base build/standard_robot_pp_ros2 --verbose
+./build.sh --packages-select standard_robot_pp_ros2
+python3 scripts/validate_navigation_config.py
 ```
 
 实机/HIL 还必须测量断流、STOP、急停、串口拔插和旧授权恢复，观察 `/cmd_vel/selected`
